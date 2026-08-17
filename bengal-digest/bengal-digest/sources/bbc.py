@@ -1,64 +1,63 @@
-import os
+import feedparser
 import requests
-
-_ALLOWED_SCHEMES = ("https://", "http://localhost", "http://127.0.0.1")
-
-_bbc_base: str | None = None
-
-
-def _get_bbc_base() -> str:
-    """Lazily validate and return BBC_API_BASE (SEC-1, SEC-3)."""
-    global _bbc_base
-    if _bbc_base is None:
-        base = os.environ.get("BBC_API_BASE", "http://localhost:3000/api")
-        if not any(base.startswith(s) for s in _ALLOWED_SCHEMES):
-            raise RuntimeError(
-                f"BBC_API_BASE must start with https:// or http://localhost, got: {base!r}"
-            )
-        _bbc_base = base.rstrip("/")
-    return _bbc_base
-
-
-# Inline import here avoids circular dependency issues if models/utils are loaded first
+import os
+from datetime import datetime
 from models import Article
 from utils import clean_text
-import urllib.parse
+
+BBC_BENGALI_RSS = "https://feeds.bbci.co.uk/bengali/rss.xml"
+BBC_API_BASE = os.environ.get("BBC_API_BASE")
 
 
-def fetch_bbc_bengali(category: str = "main", limit: int = 10) -> list[Article]:
+def fetch_bbc_bengali(limit: int = 15) -> list[Article]:
     """
-    Note: the repo's README documents GET /api/news, but that route is commented
-    out in the actual deployed code. Use /api/categories/:id instead - "main" and
-    "india" are the most relevant categories for a Bengal-focused digest.
+    Fetches news directly from BBC News বাংলা official RSS feed.
+    If BBC_API_BASE is explicitly configured to a custom scraper service,
+    it falls back to checking the custom API.
     """
-    # SEC-4: URL-encode category to prevent path traversal
-    safe_category = urllib.parse.quote(category, safe="")
-    try:
-        resp = requests.get(f"{_get_bbc_base()}/categories/{safe_category}", timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        print(f"[bbc_bengali:{category}] fetch failed: {e}")
-        return []
-
     articles = []
-    for item in data.get("articles", [])[:limit]:
-        articles.append(Article(
-            source="bbc_bengali",
-            title=clean_text(item.get("title", "")),
-            url=item.get("link", ""),
-            published_at=None,
-            content=clean_text(item.get("description") or ""),
-            language="bn",
-        ))
+
+    # 1. Primary: Direct BBC News বাংলা official RSS feed (Fast, reliable, zero server needed)
+    try:
+        feed = feedparser.parse(BBC_BENGALI_RSS)
+        for entry in feed.entries[:limit]:
+            published = None
+            if hasattr(entry, "published_parsed") and entry.published_parsed:
+                published = datetime(*entry.published_parsed[:6])
+
+            articles.append(Article(
+                source="bbc_bengali",
+                title=clean_text(entry.get("title", "")),
+                url=entry.get("link", ""),
+                published_at=published,
+                content=clean_text(entry.get("summary") or entry.get("description") or ""),
+                language="bn",
+            ))
+        if articles:
+            return articles
+    except Exception as e:
+        print(f"[bbc_bengali:rss] RSS fetch failed: {e}")
+
+    # 2. Secondary fallback: Custom deployed Node API (if user explicitly provided BBC_API_BASE)
+    if BBC_API_BASE and not BBC_API_BASE.startswith("http://localhost"):
+        try:
+            resp = requests.get(f"{BBC_API_BASE.rstrip('/')}/categories/main", timeout=10)
+            if resp.ok:
+                data = resp.json()
+                for item in data.get("articles", [])[:limit]:
+                    articles.append(Article(
+                        source="bbc_bengali",
+                        title=clean_text(item.get("title", "")),
+                        url=item.get("link", ""),
+                        published_at=None,
+                        content=clean_text(item.get("description") or ""),
+                        language="bn",
+                    ))
+        except Exception as e:
+            print(f"[bbc_bengali:custom_api] fallback failed: {e}")
+
     return articles
 
 
 def fetch_bbc_bengali_multi(categories: list[str] = None, limit_per_category: int = 10) -> list[Article]:
-    """Fetch across multiple categories (main + india recommended for Bengal relevance)."""
-    if categories is None:
-        categories = ["main", "india"]
-    articles = []
-    for cat in categories:
-        articles += fetch_bbc_bengali(category=cat, limit=limit_per_category)
-    return articles
+    return fetch_bbc_bengali(limit=limit_per_category * 2)
